@@ -67,17 +67,16 @@ g++ -std=c++17 -O2 matching_engine.cpp -o matching_engine -lpqxx -lpq -lpthread
 ```bash
 export EXCHANGE_DB_CONN="dbname=exchange_db user=postgres password=<your_password> hostaddr=127.0.0.1 port=5432"
 ```
-> ⚠️ The current source has this connection string (including a plaintext password) hardcoded in `main()`. Before publishing the repo, switch it to read from an environment variable (e.g. `std::getenv("EXCHANGE_DB_CONN")`) so no credentials end up in version control.
 
 **Run:**
 ```bash
 ./matching_engine
 ```
-The engine reads commands from `instructions.txt` in the working directory (see format below), processes them, then shuts down cleanly after a short drain period.
+The engine reads commands from Sample_testcase.txt` in the working directory (see format below), processes them, then shuts down cleanly after a short drain period.
 
 ## Input format
 
-`instructions.txt` is a plain-text command file:
+` Sample_testcase.txt` is a plain-text command file:
 
 ```
 USER <user_id> <initial_cash>
@@ -141,7 +140,3 @@ Latency grows almost perfectly linearly with queue position (~375 µs added per 
 ## Tech stack
 
 C++17/20 • Multithreading (`std::thread`, `std::mutex`, `std::condition_variable`) • Concurrent producer-consumer queues • Custom memory pooling • PostgreSQL • `libpqxx` • Event-driven architecture
-
-## License
-
-MIT (or your preference — add a `LICENSE` file with the full text).
