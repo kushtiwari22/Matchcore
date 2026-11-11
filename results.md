@@ -1,215 +1,49 @@
-# Benchmark results — limit orders
+# Results
 
-Run of 180 limit orders submitted in a single burst (order IDs 101–280). Market orders were excluded from this run to isolate matching-engine performance from external network calls.
+Machine: 4-core Intel Xeon 2.1 GHz cloud VM, Ubuntu 24.04, g++ 13.3 -O2, PostgreSQL 16 on the same machine.
+Settings: 1 matching thread, limit orders, 1 ticker.
 
 ## Summary
 
-| Metric | Value |
-|---|---|
-| Orders processed | 180 |
-| Min latency | 345 µs |
-| Max latency | 67,271 µs (~67.3 ms) |
-| Mean latency | ~32.83 ms |
-| Median latency | ~33.64 ms |
-| Std dev | ~19.50 ms |
-| Sustained throughput | ~2,676 orders/sec |
-| Per-order queueing cost (slope) | ~374.7 µs/order |
+- Matching time per order: 0.2 us median, about 20 us at p99
+- End-to-end latency, one order at a time: 25 us median, 60 us at p99
+- Max throughput: about 385,000 - 415,000 orders per second
+- Database writes: about 2,500 - 2,800 trades per second
+- FIFO check: 0 orders out of order (1 million orders)
 
-## What the numbers mean
+## Latency under load (1 million orders per test)
 
-Latency climbs almost perfectly linearly with an order's position in the processing queue (slope ≈ 374.7 µs/order, near-zero intercept). This means:
+    orders/sec   median    p99       p99.9
+    10,000       27 us     185 us    2.0 ms
+    50,000       24 us     576 us    10.6 ms
+    100,000      22 us     3.0 ms    19.1 ms
+    200,000      23 us     6.4 ms    23.9 ms
 
-- Actual per-order validation + matching cost is small (~370 µs).
-- The single-threaded validation stage (`process_initial_orders`) is the throughput ceiling — every order waits behind every order submitted before it, regardless of how simple its own validation is.
-- The first order (101) finishes in 345 µs; the 180th order to complete (170) waits ~67.3 ms purely from queueing, not compute.
+The median stays around 25 us at every rate. The p99 rises once the rate passes about
+50,000 orders/sec.
 
-This confirms the bottleneck is architectural (single validation thread), not algorithmic (the matching logic itself is fast).
+Almost all of the 25 us is two thread handoffs (about 12 us each: intake to validation,
+then validation to matching). Matching itself takes about 0.2 us.
 
-## Raw latency data
+## How these numbers were measured
 
-| Order ID | Latency (µs) |
-|---|---|
-| 101 | 345 |
-| 106 | 765 |
-| 110 | 1152 |
-| 114 | 1546 |
-| 116 | 1801 |
-| 117 | 2067 |
-| 118 | 2253 |
-| 119 | 2502 |
-| 120 | 2776 |
-| 121 | 3183 |
-| 122 | 3580 |
-| 123 | 4077 |
-| 124 | 4369 |
-| 125 | 4634 |
-| 126 | 4893 |
-| 127 | 5199 |
-| 128 | 5429 |
-| 129 | 5654 |
-| 130 | 5935 |
-| 131 | 6194 |
-| 132 | 6411 |
-| 133 | 6739 |
-| 134 | 6959 |
-| 135 | 7185 |
-| 136 | 7434 |
-| 137 | 7667 |
-| 105 | 8216 |
-| 139 | 8398 |
-| 140 | 8736 |
-| 141 | 9107 |
-| 142 | 9513 |
-| 143 | 9858 |
-| 144 | 10206 |
-| 145 | 10605 |
-| 146 | 10910 |
-| 147 | 11145 |
-| 148 | 11483 |
-| 149 | 11831 |
-| 150 | 12153 |
-| 151 | 12488 |
-| 152 | 12811 |
-| 153 | 13188 |
-| 154 | 13605 |
-| 155 | 13991 |
-| 156 | 14540 |
-| 157 | 14977 |
-| 158 | 15374 |
-| 159 | 15777 |
-| 160 | 16219 |
-| 161 | 16659 |
-| 162 | 17035 |
-| 163 | 17394 |
-| 164 | 17726 |
-| 165 | 18098 |
-| 166 | 18621 |
-| 167 | 19108 |
-| 113 | 19799 |
-| 104 | 20212 |
-| 115 | 20695 |
-| 171 | 20905 |
-| 172 | 21259 |
-| 173 | 21758 |
-| 174 | 22206 |
-| 175 | 22582 |
-| 103 | 23289 |
-| 111 | 23765 |
-| 178 | 23853 |
-| 179 | 24232 |
-| 180 | 24880 |
-| 181 | 25572 |
-| 182 | 26289 |
-| 183 | 26855 |
-| 184 | 27380 |
-| 185 | 27709 |
-| 186 | 28175 |
-| 187 | 28566 |
-| 188 | 29006 |
-| 189 | 29371 |
-| 190 | 29746 |
-| 191 | 30122 |
-| 192 | 30439 |
-| 193 | 30747 |
-| 194 | 30930 |
-| 195 | 31268 |
-| 196 | 31701 |
-| 197 | 32076 |
-| 198 | 32428 |
-| 199 | 32792 |
-| 200 | 33180 |
-| 201 | 33470 |
-| 202 | 33803 |
-| 203 | 34287 |
-| 204 | 35254 |
-| 205 | 35550 |
-| 206 | 36908 |
-| 207 | 37315 |
-| 208 | 37716 |
-| 209 | 38039 |
-| 210 | 38255 |
-| 211 | 38493 |
-| 212 | 38720 |
-| 213 | 38960 |
-| 214 | 39291 |
-| 215 | 39471 |
-| 216 | 39728 |
-| 217 | 39988 |
-| 218 | 40334 |
-| 219 | 40645 |
-| 220 | 40979 |
-| 221 | 41267 |
-| 222 | 41646 |
-| 223 | 41911 |
-| 224 | 42356 |
-| 225 | 42673 |
-| 226 | 42983 |
-| 227 | 43271 |
-| 228 | 43559 |
-| 229 | 43833 |
-| 230 | 44122 |
-| 231 | 44378 |
-| 232 | 44581 |
-| 233 | 44701 |
-| 234 | 44875 |
-| 235 | 45077 |
-| 236 | 45344 |
-| 237 | 45635 |
-| 238 | 45963 |
-| 239 | 46190 |
-| 240 | 46543 |
-| 241 | 46759 |
-| 242 | 47102 |
-| 243 | 47443 |
-| 244 | 47727 |
-| 245 | 48012 |
-| 246 | 48302 |
-| 247 | 48526 |
-| 248 | 48776 |
-| 249 | 49067 |
-| 250 | 49481 |
-| 251 | 49839 |
-| 252 | 50192 |
-| 253 | 50508 |
-| 254 | 50850 |
-| 255 | 51234 |
-| 256 | 51590 |
-| 257 | 52077 |
-| 258 | 52601 |
-| 259 | 53217 |
-| 260 | 53609 |
-| 261 | 54144 |
-| 262 | 54569 |
-| 263 | 54869 |
-| 264 | 55065 |
-| 265 | 55477 |
-| 266 | 55748 |
-| 267 | 55936 |
-| 268 | 56356 |
-| 269 | 56918 |
-| 270 | 57311 |
-| 271 | 58254 |
-| 272 | 58634 |
-| 273 | 58979 |
-| 274 | 59551 |
-| 275 | 60153 |
-| 276 | 60679 |
-| 277 | 61567 |
-| 278 | 61974 |
-| 279 | 62265 |
-| 280 | 62600 |
-| 138 | 63599 |
-| 102 | 64026 |
-| 107 | 64361 |
-| 108 | 64681 |
-| 109 | 65102 |
-| 176 | 65174 |
-| 177 | 65479 |
-| 112 | 66165 |
-| 168 | 66536 |
-| 169 | 66861 |
-| 170 | 67271 |
+- bench/patch.py makes a copy of matching_engine.cpp that records a timestamp at four points
+  for every order: submitted, validated, matching started, matching finished. Timestamps go
+  into arrays in memory; nothing is printed while orders are running. The engine logic is
+  not changed.
+- Test orders are random but repeatable (fixed seed): 100 users, buy or sell 50/50, volume
+  1-100, prices near 10,000. About 1 in 3 orders trades. All orders are created before the
+  timer starts.
+- Latency = matching finished - submitted. For the "under load" table, orders are sent at a
+  fixed rate, and latency is measured from when each order was supposed to be sent.
+- Throughput = orders processed / (time of last order finished - time of first order submitted),
+  sending 1 million orders as fast as possible.
+- Database speed = trades saved / time until the last trade was saved.
+- FIFO check = the order in which orders reached the book is compared with the order they arrived.
+- Run bench/run.sh to repeat all of these tests.
 
-## Market orders — not yet benchmarked cleanly
+## Why the old numbers were wrong
 
-An earlier run mixing in market buy orders showed latencies jumping to 2–3.5 seconds, traced to a synchronous live-price HTTP fetch (`getcurrent()`) running inside the single validation thread — this blocks every order queued behind it, not just the market order itself. See [Known limitations](README.md#known-limitations--future-work) in the README for the planned fix (background-refreshed price cache).
+The old file reported a 33 ms average latency and 2,700 orders/sec. The latency was printed
+with cout while holding the order book lock, so every order waited for the previous order's
+print. Those numbers measured the console, not the engine.
