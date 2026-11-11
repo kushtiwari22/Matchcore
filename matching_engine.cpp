@@ -12,17 +12,20 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <cstdlib>
 #include <pqxx/pqxx>
 
 using namespace std;
 
-atomic<bool> is_running(true);
+atomic<bool> validate_running(true), match_running(true), settle_running(true), db_running(true);
 
 mutex initial_queue_mutex;
 mutex pending_orders_mutex;
 mutex trade_q_mtx;
 mutex db_mtx;
-mutex orderbook_map_mtx; 
+mutex orderbook_map_mtx;
 
 condition_variable validate_cv;
 condition_variable match_order_cv;
@@ -36,11 +39,11 @@ uint64_t currTime() {
 }
 
 uint64_t getcurrent(const string& ticker) {
-    string api_key = "WRITE YOUR API KEY HERE"; 
+    string api_key = "WRITE YOUR API KEY HERE";
     string cmd = "curl -s \"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=" + ticker + "&apikey=" + api_key + "\"";
 
     FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return 100; 
+    if (!pipe) return 0;
 
     string result;
     char buffer[256];
@@ -48,12 +51,12 @@ uint64_t getcurrent(const string& ticker) {
     pclose(pipe);
 
     size_t pos = result.find("\"05. price\"");
-    if (pos == string::npos) return 100; 
+    if (pos == string::npos) return 0;
 
     pos = result.find(':', pos);
     pos = result.find('"', pos + 1);
     size_t end = result.find('"', pos + 1);
-    if (pos == string::npos || end == string::npos) return 100;
+    if (pos == string::npos || end == string::npos) return 0;
 
     double price = stod(result.substr(pos + 1, end - pos - 1));
     return static_cast<uint64_t>(price);
@@ -107,8 +110,8 @@ public:
     uint64_t remaining;
     bool is_market;
     bool is_cancelled;
-    uint64_t locked_price;                        
-    chrono::steady_clock::time_point submit_time;  
+    uint64_t locked_price;
+    chrono::steady_clock::time_point submit_time;
 
     Order() = default;
     void execute();
@@ -134,7 +137,7 @@ Order* get_new_order(string ticker, int id, int user, uint64_t volume, int type,
     o->is_market = is_market;
     o->is_cancelled = false;
     o->timestamp = currTime();
-    o->submit_time = chrono::steady_clock::now(); 
+    o->submit_time = chrono::steady_clock::now();
 
     return o;
 }
@@ -145,8 +148,12 @@ void free_order(Order* o) {
 }
 
 Trade* get_new_trade(string ticker, User* buy_user, User* sell_user, uint64_t final_price, uint64_t volume) {
-    lock_guard<mutex> lock(trade_pool_mtx);
-    if (available_trades.empty()) return nullptr;
+    unique_lock<mutex> lock(trade_pool_mtx);
+    while (available_trades.empty()) {      // pool full: wait for the DB thread to free a slot
+        lock.unlock();
+        this_thread::yield();
+        lock.lock();
+    }
 
     int idx = available_trades.front();
     available_trades.pop();
@@ -186,7 +193,7 @@ class OrderBook {
 public:
     map<uint64_t, queue<Order*>, greater<uint64_t>> buy_orders;
     map<uint64_t, queue<Order*>> sell_orders;
-    mutex book_mutex; 
+    mutex book_mutex;
 
     void match_order(User* user, Order* order);
     void insert_order(Order* order);
@@ -230,8 +237,8 @@ void Exchange::process_initial_orders() {
         Order* order = nullptr;
         {
             unique_lock<mutex> lock(initial_queue_mutex);
-            validate_cv.wait(lock, []{ return !trading_exchange.initial_order_queue.empty() || !is_running; });
-            if (trading_exchange.initial_order_queue.empty() && !is_running) break;
+            validate_cv.wait(lock, []{ return !trading_exchange.initial_order_queue.empty() || !validate_running; });
+            if (trading_exchange.initial_order_queue.empty() && !validate_running) break;
             order = initial_order_queue.front();
             initial_order_queue.pop();
         }
@@ -251,9 +258,9 @@ void Exchange::match() {
         pair<User*, Order*> pending_task;
         {
             unique_lock<mutex> lock(pending_orders_mutex);
-            match_order_cv.wait(lock, []{ return !trading_exchange.pending_orders_queue.empty() || !is_running; });
+            match_order_cv.wait(lock, []{ return !trading_exchange.pending_orders_queue.empty() || !match_running; });
 
-            if (trading_exchange.pending_orders_queue.empty() && !is_running) break;
+            if (trading_exchange.pending_orders_queue.empty() && !match_running) break;
 
             pending_task = pending_orders_queue.front();
             pending_orders_queue.pop();
@@ -272,7 +279,7 @@ void Exchange::match() {
         OrderBook* book;
         {
             lock_guard<mutex> lock(orderbook_map_mtx);
-            book = &orderbook[tick]; 
+            book = &orderbook[tick];
         }
         book->match_order(user, order);
     }
@@ -284,17 +291,18 @@ void Trade::settle() {
 
         {
             unique_lock<mutex> lock(trade_q_mtx);
-            trade_settle_cv.wait(lock, []{ return !pending_trades.empty() || !is_running; });
+            trade_settle_cv.wait(lock, []{ return !pending_trades.empty() || !settle_running; });
 
-            if (pending_trades.empty() && !is_running) break;
+            if (pending_trades.empty() && !settle_running) break;
 
             trade = pending_trades.front();
             pending_trades.pop();
         }
 
-        std::lock(trade->buy_user->wallet_lock, trade->sell_user->wallet_lock);
-        lock_guard<mutex> lock1(trade->buy_user->wallet_lock, std::adopt_lock);
-        lock_guard<mutex> lock2(trade->sell_user->wallet_lock, std::adopt_lock);
+        unique_lock<mutex> lock1(trade->buy_user->wallet_lock, defer_lock);
+        unique_lock<mutex> lock2(trade->sell_user->wallet_lock, defer_lock);
+        if (trade->buy_user == trade->sell_user) lock1.lock();   // self-trade: same mutex
+        else std::lock(lock1, lock2);
 
         string tick = trade->ticker;
 
@@ -335,9 +343,9 @@ void save_trades_to_db(const string& connection_string) {
 
             {
                 unique_lock<mutex> lock(db_mtx);
-                db_cv.wait(lock, []{ return !Trade::db_save_queue.empty() || !is_running; });
+                db_cv.wait(lock, []{ return !Trade::db_save_queue.empty() || !db_running; });
 
-                if (Trade::db_save_queue.empty() && !is_running) break;
+                if (Trade::db_save_queue.empty() && !db_running) break;
 
                 trade = Trade::db_save_queue.front();
                 Trade::db_save_queue.pop();
@@ -426,7 +434,11 @@ void Order_list::validate_and_lock(User* user, Order* order) {
         string tick = order->ticker;
         if (order->order_type == 1) {
             uint64_t required_price = order->is_market ? (getcurrent(tick) * 11) / 10 : order->order_price;
-            order->locked_price = required_price; 
+            if (required_price == 0) {   // price lookup failed
+                free_order(order);
+                return;
+            }
+            order->locked_price = required_price;
             if (user->current_amount < static_cast<int64_t>(order->order_size * required_price)) {
                 free_order(order);
                 return;
@@ -454,19 +466,19 @@ void Order_list::validate_and_lock(User* user, Order* order) {
 }
 
 void OrderBook::match_order(User* user, Order* order) {
-    lock_guard<mutex> book_lock(book_mutex); 
+    lock_guard<mutex> book_lock(book_mutex);
     string tick = order->ticker;
 
     if (order->order_type == 1) {
         while (order->remaining > 0 && !sell_orders.empty()) {
             auto sell_it = sell_orders.begin();
             Order* sell = sell_it->second.front();
-            User* sell_user = trading_exchange.userbook.id_to_user[sell->user_id]; 
+            User* sell_user = trading_exchange.userbook.id_to_user[sell->user_id];
 
             bool sell_cancelled;
             {
                 lock_guard<mutex> owner_lock(sell_user->wallet_lock);
-                sell_cancelled = sell->is_cancelled; 
+                sell_cancelled = sell->is_cancelled;
             }
             if (sell_cancelled) {
                 sell_it->second.pop();
@@ -476,6 +488,7 @@ void OrderBook::match_order(User* user, Order* order) {
             }
 
             if (!order->is_market && order->order_price < sell->order_price) break;
+            if (order->is_market && order->locked_price < sell->order_price) break;   // would exceed locked funds
 
             uint64_t match_price = sell->order_price;
             uint64_t qty = min(order->remaining, sell->remaining);
@@ -484,7 +497,7 @@ void OrderBook::match_order(User* user, Order* order) {
                 std::unique_lock<std::mutex> lock1(user->wallet_lock, std::defer_lock);
                 std::unique_lock<std::mutex> lock2(sell_user->wallet_lock, std::defer_lock);
                 if (user == sell_user) {
-                    lock1.lock(); 
+                    lock1.lock();
                 } else {
                     std::lock(lock1, lock2);
                 }
@@ -492,7 +505,7 @@ void OrderBook::match_order(User* user, Order* order) {
                 if (!order->is_market) {
                     user->current_amount += qty * (order->order_price - match_price);
                 } else {
-                    uint64_t locked_price = order->locked_price; 
+                    uint64_t locked_price = order->locked_price;
                     user->current_amount += qty * (locked_price - match_price);
                 }
 
@@ -504,8 +517,9 @@ void OrderBook::match_order(User* user, Order* order) {
             }
 
             {
+                Trade* t = get_new_trade(tick, user, sell_user, match_price, qty);   // may wait; not under trade_q_mtx
                 std::lock_guard<std::mutex> lock(trade_q_mtx);
-                Trade::pending_trades.push(get_new_trade(tick, user, sell_user, match_price, qty));
+                Trade::pending_trades.push(t);
             }
             trade_settle_cv.notify_one();
 
@@ -527,12 +541,12 @@ void OrderBook::match_order(User* user, Order* order) {
         while (order->remaining > 0 && !buy_orders.empty()) {
             auto buy_it = buy_orders.begin();
             Order* buy = buy_it->second.front();
-            User* buy_user = trading_exchange.userbook.id_to_user[buy->user_id]; 
+            User* buy_user = trading_exchange.userbook.id_to_user[buy->user_id];
 
             bool buy_cancelled;
             {
                 lock_guard<mutex> owner_lock(buy_user->wallet_lock);
-                buy_cancelled = buy->is_cancelled; 
+                buy_cancelled = buy->is_cancelled;
             }
             if (buy_cancelled) {
                 buy_it->second.pop();
@@ -550,7 +564,7 @@ void OrderBook::match_order(User* user, Order* order) {
                 std::unique_lock<std::mutex> lock1(user->wallet_lock, std::defer_lock);
                 std::unique_lock<std::mutex> lock2(buy_user->wallet_lock, std::defer_lock);
                 if (user == buy_user) {
-                    lock1.lock(); 
+                    lock1.lock();
                 } else {
                     std::lock(lock1, lock2);
                 }
@@ -563,8 +577,9 @@ void OrderBook::match_order(User* user, Order* order) {
             }
 
             {
+                Trade* t = get_new_trade(tick, buy_user, user, match_price, qty);   // may wait; not under trade_q_mtx
                 std::lock_guard<std::mutex> t_lock(trade_q_mtx);
-                Trade::pending_trades.push(get_new_trade(tick, buy_user, user, match_price, qty));
+                Trade::pending_trades.push(t);
             }
             trade_settle_cv.notify_one();
 
@@ -584,14 +599,11 @@ void OrderBook::match_order(User* user, Order* order) {
         }
     }
 
-    auto latency_us = chrono::duration_cast<chrono::microseconds>(chrono::steady_clock::now() - order->submit_time).count();
-    cout << "Order " << order->order_id << " latency: " << latency_us << " us\n";
-
     if (order->remaining > 0) {
         if (order->is_market) {
             lock_guard<mutex> lock(user->wallet_lock);
             if (order->order_type == 1) {
-                uint64_t locked_price = order->locked_price; 
+                uint64_t locked_price = order->locked_price;
                 user->current_amount += order->remaining * locked_price;
             } else {
                 user->available_shares[tick] += order->remaining;
@@ -658,12 +670,14 @@ int main() {
         available_trades.push(i);
     }
 
-    string db_credentials = "dbname=exchange_db user=postgres password=secret hostaddr=127.0.0.1 port=5432";
+    const char* env_db = getenv("EXCHANGE_DB_CONN");
+    string db_credentials = env_db ? env_db : "dbname=exchange_db user=postgres password=secret hostaddr=127.0.0.1 port=5432";
 
     thread validation_thread(&Exchange::process_initial_orders, &trading_exchange);
 
-    unsigned int num_matching_threads = thread::hardware_concurrency();
-    if (num_matching_threads == 0) num_matching_threads = 2;
+    // One matching thread: with several, workers race for book_mutex and orders on the
+    // same ticker can reach the book out of arrival order (breaks price-time priority).
+    unsigned int num_matching_threads = 1;
     vector<thread> matching_threads;
     for (unsigned int i = 0; i < num_matching_threads; i++) {
         matching_threads.emplace_back(&Exchange::match, &trading_exchange);
@@ -673,8 +687,8 @@ int main() {
     thread db_thread(save_trades_to_db, db_credentials);
 
     vector<User*> active_users;
-    
-    ifstream infile("instructions.txt");
+
+    ifstream infile("Sample_order.txt");
     string line;
     while (getline(infile, line)) {
         if (line.empty()) continue;
@@ -688,40 +702,41 @@ int main() {
             int64_t initial_amount;
             iss >> user_id >> initial_amount;
             User* new_user = new User(user_id, initial_amount);
-            new_user->available_shares["AAPL"] = 500; 
+            new_user->available_shares["AAPL"] = 500;
+            new_user->portfolio["AAPL"] = 500;
             new_user->add_demat();
             active_users.push_back(new_user);
-        } 
+        }
         else if (command == "ORDER") {
             string ticker;
-            int order_id, user_id, volume, type, is_market_int;
-            uint64_t price;
+            int order_id, user_id, type, is_market_int;
+            long long volume, price;
             iss >> ticker >> order_id >> user_id >> volume >> type >> price >> is_market_int;
             bool is_market = (is_market_int != 0);
+            if (volume <= 0 || price < 0 || (!is_market && price == 0) || (type != 1 && type != 2)) {
+                cerr << "Rejected invalid order " << order_id << "\n";
+                continue;
+            }
             Order* new_order = get_new_order(ticker, order_id, user_id, volume, type, price, is_market);
             if (new_order) {
                 new_order->execute();
+            } else {
+                cerr << "Order pool full, rejected order " << order_id << "\n";
             }
         }
     }
     infile.close();
 
-    this_thread::sleep_for(chrono::seconds(2));
+    validate_running = false; validate_cv.notify_all(); validation_thread.join();
+    match_running = false; match_order_cv.notify_all(); for (auto& t : matching_threads) t.join();
+    settle_running = false; trade_settle_cv.notify_all(); settlement_thread.join();
+    db_running = false; db_cv.notify_all(); db_thread.join();
 
-    is_running = false;
-    validate_cv.notify_all();
-    match_order_cv.notify_all();
-    trade_settle_cv.notify_all();
-    db_cv.notify_all();
-
-    validation_thread.join();
-    for (auto& t : matching_threads) t.join(); 
-    settlement_thread.join();
-    db_thread.join();
+    for (User* u : active_users) u->display();
 
     for (User* u : active_users) {
         delete u;
     }
-    
+
     return 0;
 }
